@@ -1,0 +1,430 @@
+openapi: 3.1.0
+info:
+  title: LFG Pay API
+  version: "1.0.0"
+  description: |
+    Public developer API for accepting stablecoin payments. Your server creates a
+    payment link, you redirect the buyer to the returned `checkoutUrl`, and LFG
+    POSTs a signed webhook as the payment session changes state.
+
+    Everything is scoped to the business the API key belongs to — no endpoint
+    accepts a business ID.
+
+    All request and response fields are `camelCase`.
+  contact:
+    name: LFG Support
+    url: https://help.getlfg.app
+servers:
+  - url: https://api.getlfg.app/pay
+    description: Production
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Payment links
+    description: Create and read payment links.
+
+paths:
+  /v1/payment-links:
+    post:
+      tags: [Payment links]
+      operationId: createPaymentLink
+      summary: Create a payment link
+      description: |
+        Creates a payment link and returns a hosted `checkoutUrl` to redirect the
+        buyer to. Always compute the amount on your own server — never trust an
+        amount sent from the browser.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePaymentLinkRequest"
+            examples:
+              simple:
+                summary: Charge $49.99 in USDC on Base
+                value:
+                  orderId: order_1042
+                  fiatAmount: 49.99
+                  fiatCurrency: USD
+                  token: USDC
+                  network: base
+                  successUrl: https://yourstore.com/thanks
+                  cancelUrl: https://yourstore.com/cart
+      responses:
+        "201":
+          description: Payment link created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/CreatedPaymentLink"
+                  meta:
+                    $ref: "#/components/schemas/Meta"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+    get:
+      tags: [Payment links]
+      operationId: listPaymentLinks
+      summary: List payment links
+      description: Returns your business's payment links, newest first, each with its current session.
+      parameters:
+        - name: page
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1, default: 15 }
+      responses:
+        "200":
+          description: A page of payment links.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/PaymentLink"
+                  meta:
+                    allOf:
+                      - $ref: "#/components/schemas/Meta"
+                      - $ref: "#/components/schemas/PaginationMeta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/payment-links/{id}:
+    get:
+      tags: [Payment links]
+      operationId: getPaymentLink
+      summary: Fetch a payment link
+      description: Returns a single payment link and its session. Returns `404` if the link doesn't belong to your business.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: The payment link.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    $ref: "#/components/schemas/PaymentLink"
+                  meta:
+                    $ref: "#/components/schemas/Meta"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+webhooks:
+  paymentStateChanged:
+    post:
+      operationId: paymentStateChanged
+      summary: Payment session state changed
+      description: |
+        Sent to the link's `webhookUrl` every time the payment session changes
+        state. Treat `approved` as "paid and cleared".
+
+        Each request carries `X-LFG-Timestamp` (unix seconds) and
+        `X-LFG-Signature` — `HMAC-SHA256(webhookSecret, "{timestamp}.{rawBody}")`,
+        hex-encoded. Verify against the **raw** body, before any JSON parsing.
+
+        Retried up to 3 times with exponential backoff. Return any `2xx` to acknowledge.
+      parameters:
+        - name: X-LFG-Timestamp
+          in: header
+          required: true
+          schema: { type: string }
+          description: Unix seconds the webhook was signed at. Reject anything older than a few minutes.
+        - name: X-LFG-Signature
+          in: header
+          required: true
+          schema: { type: string }
+          description: Hex-encoded `HMAC-SHA256(secret, "{timestamp}.{rawBody}")`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PaymentStateChangedEvent"
+      responses:
+        "200":
+          description: Acknowledged. Any 2xx prevents a retry.
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Your secret API key from **Settings → API Keys**, sent as
+        `Authorization: Bearer lfg_sk_live_…`. Server-side only — never ship it
+        to a browser or mobile app.
+
+  schemas:
+    PaymentToken:
+      type: string
+      enum: [USDC, USDT]
+
+    PaymentNetwork:
+      type: string
+      enum: [base, ethereum]
+
+    PaymentState:
+      type: string
+      description: |
+        Happy path: `created → opened → payment_pending → payment_detected →
+        screening_in_progress → approved → fulfilled`.
+      enum:
+        - created
+        - opened
+        - payment_pending
+        - payment_detected
+        - screening_in_progress
+        - approved
+        - fulfilled
+        - expired
+        - underpaid
+        - overpaid
+        - wrong_asset
+        - wrong_network
+        - screening_failed
+        - manual_review
+        - refund_pending
+        - refunded
+
+    PaymentLinkItem:
+      type: object
+      required: [name, quantity, unitPrice]
+      properties:
+        name: { type: string }
+        platform: { type: string }
+        region: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        unitPrice: { type: number, exclusiveMinimum: 0 }
+
+    CreatePaymentLinkRequest:
+      type: object
+      required: [orderId, fiatAmount, token, network]
+      properties:
+        orderId:
+          type: string
+          description: Your own order reference. Echoed back on webhooks and the success redirect.
+        fiatAmount:
+          type: number
+          exclusiveMinimum: 0
+          description: The amount to charge.
+        token:
+          $ref: "#/components/schemas/PaymentToken"
+        network:
+          $ref: "#/components/schemas/PaymentNetwork"
+        fiatCurrency:
+          type: string
+          default: USD
+          description: Defaults to your business currency.
+        expiryMinutes:
+          type: number
+          exclusiveMinimum: 0
+          default: 15
+          description: How long the checkout stays payable.
+        successUrl:
+          type: string
+          format: uri
+          description: Where the buyer returns after paying.
+        cancelUrl:
+          type: string
+          format: uri
+          description: Where the buyer returns on cancel or failure.
+        webhookUrl:
+          type: string
+          format: uri
+          description: Overrides the API key's default webhook URL for this link.
+        skuMetadata:
+          type: object
+          required: [items]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/PaymentLinkItem"
+
+    CreatedPaymentLink:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        linkToken:
+          type: string
+          description: "Format: `pay_<businessname>_<6-byte base64url>`."
+          examples: [pay_yourbiz_ab12cd]
+        checkoutUrl:
+          type: string
+          format: uri
+          description: Redirect the buyer here.
+          examples: [https://pay.getlfg.app/pay/pay_yourbiz_ab12cd]
+        sessionId: { type: string, format: uuid }
+        depositAddress:
+          type: string
+          description: Server-generated deposit address for this link.
+        quotedTokenAmount: { type: number }
+        feeAmount: { type: number }
+        netAmount: { type: number }
+        expiresAt: { type: string, format: date-time }
+
+    PaymentLink:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        businessId: { type: string, format: uuid }
+        orderId: { type: string }
+        linkToken: { type: string }
+        fiatCurrency: { type: string }
+        fiatAmount: { type: number }
+        token: { $ref: "#/components/schemas/PaymentToken" }
+        network: { $ref: "#/components/schemas/PaymentNetwork" }
+        quotedTokenAmount: { type: number }
+        feePercent: { type: number }
+        feeAmount: { type: number }
+        netAmount: { type: number }
+        depositAddress: { type: string }
+        state: { $ref: "#/components/schemas/PaymentState" }
+        successUrl: { type: [string, "null"], format: uri }
+        cancelUrl: { type: [string, "null"], format: uri }
+        webhookUrl: { type: [string, "null"], format: uri }
+        skuMetadataJson:
+          type: [object, "null"]
+          properties:
+            items:
+              type: array
+              items:
+                $ref: "#/components/schemas/PaymentLinkItem"
+        expiresAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }
+        session:
+          type: [object, "null"]
+          description: The current payment session for this link.
+          properties:
+            id: { type: string, format: uuid }
+            state: { $ref: "#/components/schemas/PaymentState" }
+            txHash: { type: [string, "null"] }
+            sourceWallet: { type: [string, "null"] }
+
+    PaymentStateChangedEvent:
+      type: object
+      required: [event, orderId, linkToken, state, timestamp]
+      properties:
+        event:
+          type: string
+          const: payment.state.changed
+        orderId: { type: string }
+        linkToken: { type: string }
+        state: { $ref: "#/components/schemas/PaymentState" }
+        previousState: { $ref: "#/components/schemas/PaymentState" }
+        txHash: { type: [string, "null"] }
+        sourceWallet: { type: [string, "null"] }
+        timestamp: { type: string, format: date-time }
+
+    Meta:
+      type: object
+      properties:
+        timestamp: { type: string, format: date-time }
+
+    PaginationMeta:
+      type: object
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        totalPages: { type: integer }
+
+    Error:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+        code:
+          type: string
+          description: Machine-readable code on authentication and authorization failures.
+        errors:
+          type: object
+          description: Field-keyed validation messages.
+          additionalProperties:
+            type: array
+            items: { type: string }
+
+  responses:
+    ValidationError:
+      description: The request body failed validation.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            message: Validation failed
+            errors:
+              fiatAmount: ["fiatAmount must be a positive number"]
+
+    Unauthorized:
+      description: |
+        Your credential is wrong — rotate it. `code` is one of `missing_api_key`,
+        `invalid_api_key`, `api_key_revoked`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: invalid_api_key
+            message: The API key doesn't match any active key.
+
+    Forbidden:
+      description: |
+        LFG turned something off — a new key won't help; contact support. `code`
+        is `api_key_disabled` or `business_disabled`.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            code: api_key_disabled
+            message: This API key has been disabled.
+
+    NotFound:
+      description: No such payment link for your business.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            message: Payment link not found
+
+    RateLimited:
+      description: Rate limit exceeded — 60 requests per 60 seconds, per API key.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+          example:
+            message: "ThrottlerException: Too Many Requests"
